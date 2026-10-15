@@ -1,0 +1,25 @@
+[Unit]
+Description=S3-Compatible High Performance Storage Engine
+Documentation=https://github.com/my-s3-bucket/storage-engine
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+User=storage
+Group=storage
+ExecStart=/usr/local/bin/storage-server -config /etc/storage-engine/config.yaml
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=storage-engine
+
+# Security Hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

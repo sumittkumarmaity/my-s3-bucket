@@ -1,0 +1,29 @@
+# Local Development Configuration
+server:
+  host: "127.0.0.1"
+  s3_port: 9000
+  admin_port: 9001
+
+storage:
+  root: "./data/storage"
+  max_object_size: 5368709120
+
+metadata:
+  driver: "sqlite"
+  path: "./data/metadata/storage.db"
+
+security:
+  auth_enabled: true
+  admin_access_key: "storageadmin"
+  admin_secret_key: "storageadminsecretkey123"
+  admin_token: "storageadminsecretkey123"
+
+replication:
+  enabled: false
+  node_id: "node-1"
+  listen_address: "http://127.0.0.1:9001"
+  auth_token: "rep-secret-token"
+
+jobs:
+  gc_interval_seconds: 3600
+  integrity_scan_interval_seconds: 86400

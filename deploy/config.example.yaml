@@ -1,0 +1,36 @@
+# ==============================================================================
+# S3 Storage Engine - Production Configuration File
+# ==============================================================================
+
+server:
+  host: "0.0.0.0"
+  s3_port: 9000        # S3-compatible XML API port
+  admin_port: 9001     # REST Management API & Web UI Console port
+
+storage:
+  root: "/var/lib/storage-engine/data"
+  max_object_size: 5368709120  # 5 GB in bytes
+
+metadata:
+  driver: "sqlite"
+  path: "/var/lib/storage-engine/metadata/storage.db"
+
+security:
+  auth_enabled: true
+  admin_access_key: "storageadmin"
+  admin_secret_key: "storageadminsecretkey123"
+  admin_token: "storageadminsecretkey123"
+  # Optional 32-byte AES-256 server-side encryption passphrase
+  # encryption_key: "my-ultra-secure-aes256-encryption-key"
+
+replication:
+  enabled: false
+  node_id: "node-primary-01"
+  listen_address: "http://127.0.0.1:9001"
+  auth_token: "cluster-replication-secret-token"
+  peer_nodes: []
+  poll_interval_sec: 5
+
+jobs:
+  gc_interval_seconds: 3600             # Garbage collection run interval (1 hour)
+  integrity_scan_interval_seconds: 86400 # Bit-rot integrity scanner interval (24 hours)

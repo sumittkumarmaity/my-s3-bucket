@@ -1,0 +1,16 @@
+# Binaries
+storagectl
+storage-server
+
+# Data directories
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Build artifacts
+dist/
+build/
+web/dist/
+web/node_modules/
+node_modules/
