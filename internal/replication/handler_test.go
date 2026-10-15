@@ -2,6 +2,7 @@ package replication
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -92,3 +93,70 @@ func TestReplicationSyncAndConflict(t *testing.T) {
 		t.Fatalf("expected LOCAL_KEPT, got %s", conflicts[0].Resolution)
 	}
 }
+
+func TestMultiPeerReplicationTracking(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "rep-multi-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "meta.db")
+	meta, err := metadata.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meta.Close()
+
+	ctx := context.Background()
+
+	// Enqueue a replication job
+	job := metadata.ReplicationJob{
+		ObjectID:  "obj-123",
+		BucketID:  "b-123",
+		ObjectKey: "test.dat",
+		VersionID: "null",
+		Action:    "PUT",
+	}
+	if err := meta.EnqueueReplicationJob(ctx, job); err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	jobs, err := meta.FetchPendingReplicationJobs(ctx, 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	jobID := jobs[0].ID
+
+	// Peer 1 fails
+	if err := meta.UpdatePeerReplicationStatus(ctx, jobID, "peer-1", "FAILED", "connection refused"); err != nil {
+		t.Fatalf("failed to update peer 1 status: %v", err)
+	}
+
+	// Peer 2 succeeds
+	if err := meta.UpdatePeerReplicationStatus(ctx, jobID, "peer-2", "COMPLETED", ""); err != nil {
+		t.Fatalf("failed to update peer 2 status: %v", err)
+	}
+
+	// Verify statuses
+	p1Status, p1Retries, err := meta.GetPeerReplicationStatus(ctx, jobID, "peer-1")
+	if err != nil || p1Status != "FAILED" || p1Retries != 1 {
+		t.Fatalf("expected peer 1 FAILED with 1 retry, got %s, %d", p1Status, p1Retries)
+	}
+
+	p2Status, _, err := meta.GetPeerReplicationStatus(ctx, jobID, "peer-2")
+	if err != nil || p2Status != "COMPLETED" {
+		t.Fatalf("expected peer 2 COMPLETED, got %s", p2Status)
+	}
+
+	// Retry Peer 1 and succeed
+	if err := meta.UpdatePeerReplicationStatus(ctx, jobID, "peer-1", "COMPLETED", ""); err != nil {
+		t.Fatalf("failed to update peer 1 to completed: %v", err)
+	}
+
+	p1StatusAfter, _, err := meta.GetPeerReplicationStatus(ctx, jobID, "peer-1")
+	if err != nil || p1StatusAfter != "COMPLETED" {
+		t.Fatalf("expected peer 1 COMPLETED, got %s", p1StatusAfter)
+	}
+}
+

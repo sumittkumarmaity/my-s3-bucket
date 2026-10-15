@@ -1,12 +1,15 @@
 package s3
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,11 +24,12 @@ import (
 )
 
 type S3Handler struct {
-	meta       metadata.Store
-	engine     storage.Engine
-	encryptor  encryption.Provider
-	logger     *slog.Logger
-	maxObjSize int64
+	meta        metadata.Store
+	engine      storage.Engine
+	encryptor   encryption.Provider
+	logger      *slog.Logger
+	maxObjSize  int64
+	minPartSize int64
 }
 
 func NewS3Handler(meta metadata.Store, engine storage.Engine, enc encryption.Provider, maxObjSize int64, logger *slog.Logger) *S3Handler {
@@ -39,13 +43,19 @@ func NewS3Handler(meta metadata.Store, engine storage.Engine, enc encryption.Pro
 		maxObjSize = 5 * 1024 * 1024 * 1024 // 5GB
 	}
 	return &S3Handler{
-		meta:       meta,
-		engine:     engine,
-		encryptor:  enc,
-		logger:     logger,
-		maxObjSize: maxObjSize,
+		meta:        meta,
+		engine:      engine,
+		encryptor:   enc,
+		logger:      logger,
+		maxObjSize:  maxObjSize,
+		minPartSize: 0,
 	}
 }
+
+func (h *S3Handler) SetMinPartSize(size int64) {
+	h.minPartSize = size
+}
+
 
 // ServeHTTP routes incoming S3 requests
 func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -488,6 +498,14 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
+	// Check Content-Length against available capacity
+	if r.ContentLength > 0 {
+		if err := h.engine.CheckCapacity(r.Context(), r.ContentLength); err != nil {
+			SendS3Error(w, r, http.StatusInsufficientStorage, "InsufficientStorage", "Insufficient storage space remaining on cluster node.")
+			return
+		}
+	}
+
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -495,8 +513,13 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 
 	objectID := uuid.NewString()
 	versionID := "null"
+	var oldObjID string
 	if b.VersioningStatus == "ENABLED" {
 		versionID = uuid.NewString()
+	} else {
+		if oldObj, err := h.meta.GetObject(r.Context(), b.ID, objectKey, "null"); err == nil && oldObj.ID != "" {
+			oldObjID = oldObj.ID
+		}
 	}
 
 	// Wrap in streaming checksum calculation
@@ -526,6 +549,16 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 	crc32c := hr.CRC32CHex()
 	sha256Hex := hr.SHA256Hex()
 
+	// Verify X-Amz-Content-Sha256 if provided and not unsigned/streaming
+	contentSHA := r.Header.Get("X-Amz-Content-Sha256")
+	if contentSHA != "" && contentSHA != "UNSIGNED-PAYLOAD" && !strings.EqualFold(contentSHA, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+		if !strings.EqualFold(contentSHA, sha256Hex) {
+			_ = h.engine.Delete(r.Context(), objectID)
+			SendS3Error(w, r, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
+	}
+
 	obj := metadata.Object{
 		ID:             objectID,
 		BucketID:       b.ID,
@@ -551,6 +584,11 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		_ = h.engine.Delete(r.Context(), objectID)
 		SendS3Error(w, r, http.StatusInternalServerError, "InternalError", "Failed to commit object metadata")
 		return
+	}
+
+	// If overwriting unversioned object, reclaim the old physical file immediately
+	if oldObjID != "" && oldObjID != objectID {
+		_ = h.engine.Delete(r.Context(), oldObjID)
 	}
 
 	// Enqueue replication outbox job
@@ -771,6 +809,14 @@ func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
+	// Check Content-Length against available capacity
+	if r.ContentLength > 0 {
+		if err := h.engine.CheckCapacity(r.Context(), r.ContentLength); err != nil {
+			SendS3Error(w, r, http.StatusInsufficientStorage, "InsufficientStorage", "Insufficient storage space remaining on cluster node.")
+			return
+		}
+	}
+
 	hr := integrity.NewHashingReader(r.Body)
 	written, partPath, err := h.engine.PutPart(r.Context(), uploadID, partNum, hr)
 	if err != nil {
@@ -784,6 +830,17 @@ func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, buc
 
 	etag := hr.ETag()
 	checksum := hr.CRC32CHex()
+	sha256Hex := hr.SHA256Hex()
+
+	// Verify X-Amz-Content-Sha256 if provided and not unsigned/streaming
+	contentSHA := r.Header.Get("X-Amz-Content-Sha256")
+	if contentSHA != "" && contentSHA != "UNSIGNED-PAYLOAD" && !strings.EqualFold(contentSHA, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+		if !strings.EqualFold(contentSHA, sha256Hex) {
+			_ = os.Remove(partPath)
+			SendS3Error(w, r, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
+	}
 
 	part := metadata.MultipartPart{
 		UploadID:     uploadID,
@@ -805,14 +862,23 @@ func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, buc
 }
 
 func (h *S3Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	_, _, ok := h.getBucketAndAuthorize(w, r, bucketName)
+	b, _, ok := h.getBucketAndAuthorize(w, r, bucketName)
 	if !ok {
 		return
 	}
 
 	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		SendS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing uploadId parameter")
+		return
+	}
+	if _, err := uuid.Parse(uploadID); err != nil {
+		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+		return
+	}
+
 	mp, err := h.meta.GetMultipartUpload(r.Context(), uploadID)
-	if err != nil {
+	if err != nil || mp.BucketID != b.ID || mp.ObjectKey != objectKey {
 		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
 		return
 	}
@@ -849,32 +915,136 @@ func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http
 	}
 
 	uploadID := r.URL.Query().Get("uploadId")
-	mp, err := h.meta.GetMultipartUpload(r.Context(), uploadID)
-	if err != nil {
+	if uploadID == "" {
+		SendS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing uploadId parameter")
+		return
+	}
+	if _, err := uuid.Parse(uploadID); err != nil {
 		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
 		return
 	}
 
-	// Parse completion request XML
-	var compReq CompleteMultipartUploadRequest
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err == nil && len(bodyBytes) > 0 {
-		_ = xml.Unmarshal(bodyBytes, &compReq)
+	mp, err := h.meta.GetMultipartUpload(r.Context(), uploadID)
+	if err != nil || mp.BucketID != b.ID || mp.ObjectKey != objectKey {
+		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+		return
 	}
 
-	parts, err := h.meta.ListMultipartParts(r.Context(), uploadID)
-	if err != nil || len(parts) == 0 {
+	// 1. Parse client completion request XML
+	var compReq CompleteMultipartUploadRequest
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		SendS3Error(w, r, http.StatusBadRequest, "IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+		return
+	}
+	if len(bodyBytes) > 0 {
+		if err := xml.Unmarshal(bodyBytes, &compReq); err != nil {
+			SendS3Error(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+			return
+		}
+	}
+
+	// 2. Fetch recorded parts from metadata store
+	dbParts, err := h.meta.ListMultipartParts(r.Context(), uploadID)
+	if err != nil || len(dbParts) == 0 {
 		SendS3Error(w, r, http.StatusBadRequest, "InvalidPart", "No parts found for this upload")
 		return
 	}
 
-	var partPaths []string
-	for _, p := range parts {
-		partPaths = append(partPaths, p.PhysicalPath)
+	partsMap := make(map[int]metadata.MultipartPart)
+	for _, p := range dbParts {
+		partsMap[p.PartNumber] = p
+	}
+
+	// 3. Validate parts list and order
+	var selectedParts []metadata.MultipartPart
+	if len(compReq.Parts) > 0 {
+		lastPartNum := 0
+		for _, pInput := range compReq.Parts {
+			if pInput.PartNumber <= lastPartNum {
+				SendS3Error(w, r, http.StatusBadRequest, "InvalidPartOrder", "The list of parts was not in ascending order. Parts must be ordered by part number.")
+				return
+			}
+			lastPartNum = pInput.PartNumber
+
+			dbPart, exists := partsMap[pInput.PartNumber]
+			if !exists {
+				SendS3Error(w, r, http.StatusBadRequest, "InvalidPart", fmt.Sprintf("One or more of the specified parts could not be found. Part %d does not exist.", pInput.PartNumber))
+				return
+			}
+			cleanInputETag := strings.Trim(pInput.ETag, "\"")
+			cleanDbETag := strings.Trim(dbPart.ETag, "\"")
+			if cleanInputETag != cleanDbETag {
+				SendS3Error(w, r, http.StatusBadRequest, "InvalidPart", fmt.Sprintf("ETag mismatch for part %d.", pInput.PartNumber))
+				return
+			}
+			selectedParts = append(selectedParts, dbPart)
+		}
+	} else {
+		selectedParts = dbParts
+	}
+
+	// 4. Validate part sizes (every part except last must be >= minPartSize if configured)
+	if h.minPartSize > 0 && len(selectedParts) > 1 {
+		for i := 0; i < len(selectedParts)-1; i++ {
+			if selectedParts[i].Size < h.minPartSize {
+				SendS3Error(w, r, http.StatusBadRequest, "EntityTooSmall", fmt.Sprintf("Your proposed upload is smaller than the minimum allowed object size. Part %d size is %d bytes, minimum allowed is %d bytes.", selectedParts[i].PartNumber, selectedParts[i].Size, h.minPartSize))
+				return
+			}
+		}
+	}
+
+	// 5. Compute deterministic RFC-compliant S3 Multipart ETag
+	var concatenatedMD5s []byte
+	for _, part := range selectedParts {
+		cleanETag := strings.Trim(part.ETag, "\"")
+		partMD5Bytes, err := hex.DecodeString(cleanETag)
+		if err != nil || len(partMD5Bytes) != 16 {
+			sum := md5.Sum([]byte(cleanETag))
+			partMD5Bytes = sum[:]
+		}
+		concatenatedMD5s = append(concatenatedMD5s, partMD5Bytes...)
+	}
+	combinedMD5 := md5.Sum(concatenatedMD5s)
+	multipartETag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(combinedMD5[:]), len(selectedParts))
+
+	// 6. Open part streams and assemble
+	var filesToClose []*os.File
+	var readers []io.Reader
+	var totalPlainSize int64
+
+	defer func() {
+		for _, f := range filesToClose {
+			_ = f.Close()
+		}
+	}()
+
+	for _, part := range selectedParts {
+		f, err := os.Open(part.PhysicalPath)
+		if err != nil {
+			SendS3Error(w, r, http.StatusInternalServerError, "InternalError", fmt.Sprintf("Failed to open part %d", part.PartNumber))
+			return
+		}
+		filesToClose = append(filesToClose, f)
+		readers = append(readers, f)
+		totalPlainSize += part.Size
+	}
+
+	combinedReader := io.MultiReader(readers...)
+
+	// Stream through encryption if enabled so assembled object matches single-part format
+	var finalReader io.Reader = combinedReader
+	if h.encryptor != nil && h.encryptor.IsEnabled() {
+		encReader, err := h.encryptor.Encrypt(combinedReader)
+		if err != nil {
+			SendS3Error(w, r, http.StatusInternalServerError, "InternalError", "Failed to encrypt assembled object")
+			return
+		}
+		finalReader = encReader
 	}
 
 	objectID := uuid.NewString()
-	totalWritten, err := h.engine.AssembleParts(r.Context(), objectID, partPaths)
+	_, err = h.engine.Put(r.Context(), objectID, finalReader)
 	if err != nil {
 		if errors.Is(err, storage.ErrInsufficientStorage) {
 			SendS3Error(w, r, http.StatusInsufficientStorage, "InsufficientStorage", "Insufficient storage space remaining on cluster node.")
@@ -884,8 +1054,6 @@ func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Compute combined ETag
-	multipartETag := fmt.Sprintf("\"%s-%d\"", uuid.NewString()[:16], len(parts))
 	versionID := "null"
 	if b.VersioningStatus == "ENABLED" {
 		versionID = uuid.NewString()
@@ -896,7 +1064,7 @@ func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http
 		BucketID:       b.ID,
 		ObjectKey:      objectKey,
 		VersionID:      versionID,
-		Size:           totalWritten,
+		Size:           totalPlainSize,
 		ETag:           multipartETag,
 		ChecksumCRC32C: "",
 		ChecksumSHA256: "",
@@ -911,7 +1079,7 @@ func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Cleanup multipart metadata and files
+	// Cleanup multipart metadata and parts on disk
 	_ = h.meta.DeleteMultipartUpload(r.Context(), uploadID)
 	_ = h.engine.DeleteMultipartUpload(r.Context(), uploadID)
 
@@ -937,12 +1105,33 @@ func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http
 }
 
 func (h *S3Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucketName, objectKey string) {
-	_, _, ok := h.getBucketAndAuthorize(w, r, bucketName)
+	b, _, ok := h.getBucketAndAuthorize(w, r, bucketName)
 	if !ok {
 		return
 	}
 
 	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		SendS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing uploadId parameter")
+		return
+	}
+
+	if _, err := uuid.Parse(uploadID); err != nil {
+		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+		return
+	}
+
+	mp, err := h.meta.GetMultipartUpload(r.Context(), uploadID)
+	if err != nil {
+		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+		return
+	}
+
+	if mp.BucketID != b.ID || mp.ObjectKey != objectKey {
+		SendS3Error(w, r, http.StatusNotFound, "NoSuchUpload", "The specified multipart upload does not exist.")
+		return
+	}
+
 	_ = h.meta.DeleteMultipartUpload(r.Context(), uploadID)
 	_ = h.engine.DeleteMultipartUpload(r.Context(), uploadID)
 	w.WriteHeader(http.StatusNoContent)

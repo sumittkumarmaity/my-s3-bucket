@@ -6,10 +6,16 @@ server:
   host: "0.0.0.0"
   s3_port: 9000        # S3-compatible XML API port
   admin_port: 9001     # REST Management API & Web UI Console port
+  tls:
+    enabled: false     # Set to true for native HTTPS/TLS
+    cert_file: "/etc/storage-engine/tls/server.crt"
+    key_file: "/etc/storage-engine/tls/server.key"
 
 storage:
   root: "/var/lib/storage-engine/data"
   max_object_size: 5368709120  # 5 GB in bytes
+  min_free_space_bytes: 10737418240 # Minimum 10 GiB free space before rejecting writes (HTTP 507)
+  min_free_space_percent: 5.0       # Minimum 5% disk headroom required
 
 metadata:
   driver: "sqlite"

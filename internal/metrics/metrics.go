@@ -11,12 +11,30 @@ import (
 	"github.com/my-s3-bucket/storage-engine/internal/storage"
 )
 
+var histogramBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}
+
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *statusCapturingResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 type Registry struct {
-	TotalRequests   atomic.Uint64
-	ActiveUploads   atomic.Int64
-	ErrorsCount     atomic.Uint64
-	meta            metadata.Store
-	engine          storage.Engine
+	TotalRequests      atomic.Uint64
+	ActiveUploads      atomic.Int64
+	ErrorsCount        atomic.Uint64
+	Status2xx          atomic.Uint64
+	Status4xx          atomic.Uint64
+	Status5xx          atomic.Uint64
+	DurationBuckets    [11]atomic.Uint64
+	DurationSumSeconds atomic.Uint64 // stored in microsecond units
+	DurationCount      atomic.Uint64
+	meta               metadata.Store
+	engine             storage.Engine
 }
 
 var DefaultRegistry = &Registry{}
@@ -34,7 +52,30 @@ func (r *Registry) Middleware(next http.Handler) http.Handler {
 			r.ActiveUploads.Add(1)
 			defer r.ActiveUploads.Add(-1)
 		}
-		next.ServeHTTP(w, req)
+
+		start := time.Now()
+		rw := &statusCapturingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(rw, req)
+
+		durationSec := time.Since(start).Seconds()
+		r.DurationCount.Add(1)
+		r.DurationSumSeconds.Add(uint64(durationSec * 1e6))
+
+		for i, b := range histogramBuckets {
+			if durationSec <= b {
+				r.DurationBuckets[i].Add(1)
+			}
+		}
+
+		if rw.statusCode >= 200 && rw.statusCode < 300 {
+			r.Status2xx.Add(1)
+		} else if rw.statusCode >= 400 && rw.statusCode < 500 {
+			r.Status4xx.Add(1)
+			r.ErrorsCount.Add(1)
+		} else if rw.statusCode >= 500 {
+			r.Status5xx.Add(1)
+			r.ErrorsCount.Add(1)
+		}
 	})
 }
 
@@ -58,6 +99,26 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "# HELP storage_requests_total Total number of HTTP requests\n")
 	fmt.Fprintf(w, "# TYPE storage_requests_total counter\n")
 	fmt.Fprintf(w, "storage_requests_total %d\n", r.TotalRequests.Load())
+
+	fmt.Fprintf(w, "# HELP s3_requests_total S3 HTTP requests broken down by status class\n")
+	fmt.Fprintf(w, "# TYPE s3_requests_total counter\n")
+	fmt.Fprintf(w, "s3_requests_total{status=\"2xx\"} %d\n", r.Status2xx.Load())
+	fmt.Fprintf(w, "s3_requests_total{status=\"4xx\"} %d\n", r.Status4xx.Load())
+	fmt.Fprintf(w, "s3_requests_total{status=\"5xx\"} %d\n", r.Status5xx.Load())
+
+	fmt.Fprintf(w, "# HELP s3_errors_total Total number of HTTP client and server errors\n")
+	fmt.Fprintf(w, "# TYPE s3_errors_total counter\n")
+	fmt.Fprintf(w, "s3_errors_total %d\n", r.ErrorsCount.Load())
+
+	fmt.Fprintf(w, "# HELP s3_request_duration_seconds Request duration histogram\n")
+	fmt.Fprintf(w, "# TYPE s3_request_duration_seconds histogram\n")
+	for i, b := range histogramBuckets {
+		fmt.Fprintf(w, "s3_request_duration_seconds_bucket{le=\"%g\"} %d\n", b, r.DurationBuckets[i].Load())
+	}
+	fmt.Fprintf(w, "s3_request_duration_seconds_bucket{le=\"+Inf\"} %d\n", r.DurationCount.Load())
+	sumSec := float64(r.DurationSumSeconds.Load()) / 1e6
+	fmt.Fprintf(w, "s3_request_duration_seconds_sum %g\n", sumSec)
+	fmt.Fprintf(w, "s3_request_duration_seconds_count %d\n", r.DurationCount.Load())
 
 	fmt.Fprintf(w, "# HELP storage_active_uploads Currently active uploads\n")
 	fmt.Fprintf(w, "# TYPE storage_active_uploads gauge\n")

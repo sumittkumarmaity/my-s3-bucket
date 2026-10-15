@@ -167,6 +167,8 @@ type Store interface {
 	EnqueueReplicationJob(ctx context.Context, job ReplicationJob) error
 	FetchPendingReplicationJobs(ctx context.Context, limit int) ([]ReplicationJob, error)
 	UpdateReplicationJobStatus(ctx context.Context, id int64, status string, errMsg string) error
+	GetPeerReplicationStatus(ctx context.Context, outboxID int64, peerID string) (status string, retryCount int, err error)
+	UpdatePeerReplicationStatus(ctx context.Context, outboxID int64, peerID string, status string, errMsg string) error
 	RecordReplicationConflict(ctx context.Context, conflict ReplicationConflict) error
 	ListReplicationConflicts(ctx context.Context) ([]ReplicationConflict, error)
 
@@ -177,4 +179,6 @@ type Store interface {
 	// Health / DB
 	Ping(ctx context.Context) error
 	Close() error
+	Backup(ctx context.Context, destPath string) error
 }
+

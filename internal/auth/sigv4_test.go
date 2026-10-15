@@ -66,4 +66,17 @@ func TestSigV4Verification(t *testing.T) {
 	if err != ErrSignatureDoesNotMatch {
 		t.Fatalf("expected ErrSignatureDoesNotMatch, got %v", err)
 	}
+
+	// Test clock skew (> 15 minutes old)
+	oldReq := httptest.NewRequest(http.MethodGet, "http://localhost:9000/my-bucket/photo.jpg", nil)
+	oldReq.Header.Set("Host", "localhost:9000")
+	oldTime := now.Add(-20 * time.Minute)
+	oldReq.Header.Set("X-Amz-Date", oldTime.Format("20060102T150405Z"))
+	oldReq.Header.Set("X-Amz-Content-Sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	oldReq.Header.Set("Authorization", authHeader)
+	_, err = verifier.VerifyRequest(oldReq, secretKey)
+	if err != ErrRequestTimeTooSkewed {
+		t.Fatalf("expected ErrRequestTimeTooSkewed, got %v", err)
+	}
 }
+

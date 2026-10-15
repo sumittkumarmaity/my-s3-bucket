@@ -2,15 +2,23 @@ package config
 
 import (
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
 
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
 type Config struct {
 	Server struct {
-		Host      string `yaml:"host"`
-		S3Port    int    `yaml:"s3_port"`
-		AdminPort int    `yaml:"admin_port"`
+		Host      string    `yaml:"host"`
+		S3Port    int       `yaml:"s3_port"`
+		AdminPort int       `yaml:"admin_port"`
+		TLS       TLSConfig `yaml:"tls"`
 	} `yaml:"server"`
 
 	Storage struct {
@@ -34,12 +42,12 @@ type Config struct {
 	} `yaml:"security"`
 
 	Replication struct {
-		Enabled           bool     `yaml:"enabled"`
-		NodeID            string   `yaml:"node_id"`
-		ListenAddress     string   `yaml:"listen_address"`
-		AuthToken         string   `yaml:"auth_token"`
-		PeerNodes         []string `yaml:"peer_nodes"`
-		PollIntervalSec   int      `yaml:"poll_interval_sec"`
+		Enabled         bool     `yaml:"enabled"`
+		NodeID          string   `yaml:"node_id"`
+		ListenAddress   string   `yaml:"listen_address"`
+		AuthToken       string   `yaml:"auth_token"`
+		PeerNodes       []string `yaml:"peer_nodes"`
+		PollIntervalSec int      `yaml:"poll_interval_sec"`
 	} `yaml:"replication"`
 
 	Jobs struct {
@@ -86,6 +94,7 @@ func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			applyEnvOverrides(cfg)
 			return cfg, nil
 		}
 		return nil, err
@@ -94,6 +103,8 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
+
+	applyEnvOverrides(cfg)
 
 	if cfg.Security.AdminToken == "" && cfg.Security.AdminSecretKey != "" {
 		cfg.Security.AdminToken = cfg.Security.AdminSecretKey
@@ -107,4 +118,53 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	if v := os.Getenv("STORAGE_SERVER_HOST"); v != "" {
+		cfg.Server.Host = v
+	}
+	if v := os.Getenv("STORAGE_S3_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.Server.S3Port = p
+		}
+	}
+	if v := os.Getenv("STORAGE_ADMIN_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.Server.AdminPort = p
+		}
+	}
+	if v := os.Getenv("STORAGE_DATA_ROOT"); v != "" {
+		cfg.Storage.Root = v
+	}
+	if v := os.Getenv("STORAGE_METADATA_PATH"); v != "" {
+		cfg.Metadata.Path = v
+	}
+	if v := os.Getenv("STORAGE_ADMIN_ACCESS_KEY"); v != "" {
+		cfg.Security.AdminAccessKey = v
+	}
+	if v := os.Getenv("STORAGE_ADMIN_SECRET_KEY"); v != "" {
+		cfg.Security.AdminSecretKey = v
+	}
+	if v := os.Getenv("STORAGE_ADMIN_TOKEN"); v != "" {
+		cfg.Security.AdminToken = v
+	}
+	if v := os.Getenv("STORAGE_ENCRYPTION_KEY"); v != "" {
+		cfg.Security.EncryptionKey = v
+	}
+	if v := os.Getenv("STORAGE_REPLICATION_AUTH_TOKEN"); v != "" {
+		cfg.Replication.AuthToken = v
+	}
+	if v := os.Getenv("STORAGE_REPLICATION_NODE_ID"); v != "" {
+		cfg.Replication.NodeID = v
+	}
+	if v := os.Getenv("STORAGE_TLS_ENABLED"); v != "" {
+		cfg.Server.TLS.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("STORAGE_TLS_CERT_FILE"); v != "" {
+		cfg.Server.TLS.CertFile = v
+	}
+	if v := os.Getenv("STORAGE_TLS_KEY_FILE"); v != "" {
+		cfg.Server.TLS.KeyFile = v
+	}
 }

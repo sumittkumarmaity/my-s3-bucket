@@ -47,7 +47,7 @@ func TestEndToEndStorageEngine(t *testing.T) {
 
 	encProvider := &encryption.NoOpProvider{}
 
-	jobManager := jobs.NewManager(meta, engine, storageDir, 3600, 86400, nil)
+	jobManager := jobs.NewManager(meta, engine, storageDir, 3600, 86400, encProvider, nil)
 	ctx := context.Background()
 	jobManager.Start(ctx)
 	defer jobManager.Stop()

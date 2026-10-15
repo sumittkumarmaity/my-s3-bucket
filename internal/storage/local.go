@@ -2,21 +2,25 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/google/uuid"
 )
 
+const numStripedLocks = 1024
+
 type LocalDiskEngine struct {
 	root                string
 	objectsDir          string
 	multipartDir        string
-	locks               sync.Map // physicalID -> *sync.Mutex
+	stripedLocks        [numStripedLocks]sync.Mutex
 	minFreeSpaceBytes   int64
 	minFreeSpacePercent float64
 }
@@ -44,8 +48,8 @@ func (e *LocalDiskEngine) SetAdmissionThresholds(minBytes int64, minPercent floa
 	e.minFreeSpacePercent = minPercent
 }
 
-func (e *LocalDiskEngine) checkWriteAdmission(ctx context.Context) error {
-	if e.minFreeSpaceBytes <= 0 && e.minFreeSpacePercent <= 0 {
+func (e *LocalDiskEngine) CheckCapacity(ctx context.Context, requiredBytes int64) error {
+	if e.minFreeSpaceBytes <= 0 && e.minFreeSpacePercent <= 0 && requiredBytes <= 0 {
 		return nil
 	}
 	usage, err := e.DiskUsage(ctx)
@@ -55,11 +59,15 @@ func (e *LocalDiskEngine) checkWriteAdmission(ctx context.Context) error {
 	if usage.TotalBytes <= 0 {
 		return nil
 	}
-	if e.minFreeSpaceBytes > 0 && usage.FreeBytes < e.minFreeSpaceBytes {
+	remainingFree := usage.FreeBytes - requiredBytes
+	if remainingFree < 0 {
+		return ErrInsufficientStorage
+	}
+	if e.minFreeSpaceBytes > 0 && remainingFree < e.minFreeSpaceBytes {
 		return ErrInsufficientStorage
 	}
 	if e.minFreeSpacePercent > 0 {
-		freePercent := (float64(usage.FreeBytes) / float64(usage.TotalBytes)) * 100.0
+		freePercent := (float64(remainingFree) / float64(usage.TotalBytes)) * 100.0
 		if freePercent < e.minFreeSpacePercent {
 			return ErrInsufficientStorage
 		}
@@ -67,9 +75,22 @@ func (e *LocalDiskEngine) checkWriteAdmission(ctx context.Context) error {
 	return nil
 }
 
+func (e *LocalDiskEngine) checkWriteAdmission(ctx context.Context) error {
+	return e.CheckCapacity(ctx, 0)
+}
+
+func fnv32a(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
 func (e *LocalDiskEngine) getLock(key string) *sync.Mutex {
-	v, _ := e.locks.LoadOrStore(key, &sync.Mutex{})
-	return v.(*sync.Mutex)
+	idx := fnv32a(key) % numStripedLocks
+	return &e.stripedLocks[idx]
 }
 
 // PhysicalPath computes the 2-level hashed directory path for an object.
@@ -190,7 +211,10 @@ func (e *LocalDiskEngine) PutPart(ctx context.Context, uploadID string, partNumb
 	mu.Lock()
 	defer mu.Unlock()
 
-	uploadDir := filepath.Join(e.multipartDir, uploadID)
+	uploadDir, err := e.validateUploadDir(uploadID)
+	if err != nil {
+		return 0, "", err
+	}
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
 		return 0, "", fmt.Errorf("failed to create upload dir: %w", err)
 	}
@@ -276,8 +300,24 @@ func (e *LocalDiskEngine) AssembleParts(ctx context.Context, physicalID string, 
 	return totalWritten, nil
 }
 
+func (e *LocalDiskEngine) validateUploadDir(uploadID string) (string, error) {
+	cleanID := filepath.Clean(uploadID)
+	if strings.Contains(cleanID, "..") || strings.Contains(cleanID, "/") || strings.Contains(cleanID, "\\") || cleanID == "." {
+		return "", errors.New("invalid multipart upload ID: path traversal attempt")
+	}
+	uploadDir := filepath.Join(e.multipartDir, cleanID)
+	rel, err := filepath.Rel(e.multipartDir, uploadDir)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return "", errors.New("invalid multipart upload ID: path escapes multipart directory")
+	}
+	return uploadDir, nil
+}
+
 func (e *LocalDiskEngine) DeleteMultipartUpload(ctx context.Context, uploadID string) error {
-	uploadDir := filepath.Join(e.multipartDir, uploadID)
+	uploadDir, err := e.validateUploadDir(uploadID)
+	if err != nil {
+		return err
+	}
 	return os.RemoveAll(uploadDir)
 }
 

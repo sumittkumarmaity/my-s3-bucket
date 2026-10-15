@@ -156,6 +156,10 @@ func (p *AESGCMProvider) Decrypt(r io.Reader) (io.Reader, error) {
 			}
 
 			cipherLen := binary.BigEndian.Uint32(header[0:4])
+			if cipherLen > chunkSize+16 || cipherLen < 16 {
+				_ = pw.CloseWithError(ErrDecryptionFailed)
+				return
+			}
 			isLast := header[4]
 
 			cipherBuf := make([]byte, cipherLen)

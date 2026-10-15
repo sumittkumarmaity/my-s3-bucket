@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/my-s3-bucket/storage-engine/internal/encryption"
 	"github.com/my-s3-bucket/storage-engine/internal/integrity"
 	"github.com/my-s3-bucket/storage-engine/internal/metadata"
 	"github.com/my-s3-bucket/storage-engine/internal/storage"
@@ -39,9 +40,12 @@ type Manager struct {
 	wg               sync.WaitGroup
 }
 
-func NewManager(meta metadata.Store, engine storage.Engine, storageRoot string, gcIntervalSec, scanIntervalSec int, logger *slog.Logger) *Manager {
+func NewManager(meta metadata.Store, engine storage.Engine, storageRoot string, gcIntervalSec, scanIntervalSec int, enc encryption.Provider, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if enc == nil {
+		enc = &encryption.NoOpProvider{}
 	}
 	if gcIntervalSec <= 0 {
 		gcIntervalSec = 3600
@@ -54,7 +58,7 @@ func NewManager(meta metadata.Store, engine storage.Engine, storageRoot string, 
 		meta:         meta,
 		engine:       engine,
 		storageRoot:  storageRoot,
-		scanner:      integrity.NewScanner(meta, engine, logger),
+		scanner:      integrity.NewScanner(meta, engine, enc, logger),
 		logger:       logger,
 		gcInterval:   time.Duration(gcIntervalSec) * time.Second,
 		scanInterval: time.Duration(scanIntervalSec) * time.Second,
@@ -138,9 +142,21 @@ func (m *Manager) RunGC(ctx context.Context) (*GCReport, error) {
 		}
 	}
 
-	// 2. Scan physical object files and clean orphaned temporary files (.tmp)
+	// 2. Scan physical object files, clean orphaned temporary files (.tmp), and clean unreferenced .data files
 	objectsDir := filepath.Join(m.storageRoot, "objects")
 	cutoffTmp := time.Now().Add(-1 * time.Hour)
+	cutoffData := time.Now().Add(-10 * time.Minute)
+
+	activeObjects, err := m.meta.GetAllObjects(ctx)
+	activeIDs := make(map[string]struct{})
+	hasActiveSet := (err == nil)
+	if hasActiveSet {
+		for _, o := range activeObjects {
+			if !o.IsDeleteMarker {
+				activeIDs[o.ID] = struct{}{}
+			}
+		}
+	}
 
 	_ = filepath.WalkDir(objectsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -154,6 +170,20 @@ func (m *Manager) RunGC(ctx context.Context) (*GCReport, error) {
 				report.BytesFreed += fi.Size()
 				_ = os.Remove(path)
 				report.OrphanFilesCleaned++
+			}
+			return nil
+		}
+
+		// Clean unreferenced .data files
+		if strings.HasSuffix(name, ".data") && hasActiveSet {
+			objectID := strings.TrimSuffix(name, ".data")
+			if _, active := activeIDs[objectID]; !active {
+				if fi, err := d.Info(); err == nil && fi.ModTime().Before(cutoffData) {
+					report.BytesFreed += fi.Size()
+					_ = os.Remove(path)
+					report.OrphanFilesCleaned++
+					m.logger.Info("Cleaned unreferenced orphaned object file", "path", path, "object_id", objectID)
+				}
 			}
 		}
 

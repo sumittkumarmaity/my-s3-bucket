@@ -11,16 +11,20 @@ A lightweight, standalone, high-performance S3-compatible object storage service
 ## Table of Contents
 
 - [Features](#features)
+- [Enterprise Documentation & Architecture Guides](#enterprise-documentation--architecture-guides)
 - [Architecture & Port Overview](#architecture--port-overview)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
   - [Option A: Build from Source (Local / Development)](#option-a-build-from-source-local--development)
   - [Option B: Automated Production Install (Linux / systemd)](#option-b-automated-production-install-linux--systemd)
   - [Option C: Rebuilding the Web Console (Optional)](#option-c-rebuilding-the-web-console-optional)
-- [Configuration](#configuration)
+- [Configuration & Environment Variables](#configuration--environment-variables)
+  - [Configuration Reference (`config.yaml`)](#configuration-reference-configyaml)
+  - [Environment Variable Overrides](#environment-variable-overrides)
 - [Starting the Application](#starting-the-application)
   - [1. Running Locally (Foreground)](#1-running-locally-foreground)
   - [2. Running as a Service (systemd)](#2-running-as-a-service-systemd)
+- [Enterprise Backup & Disaster Recovery](#enterprise-backup--disaster-recovery)
 - [Web Management Console](#web-management-console)
 - [Command-Line Management (`storagectl`)](#command-line-management-storagectl)
 - [Connecting with S3 Clients & SDKs](#connecting-with-s3-clients--sdks)
@@ -32,6 +36,7 @@ A lightweight, standalone, high-performance S3-compatible object storage service
 - [Running Tests](#running-tests)
 - [Directory Structure](#directory-structure)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
@@ -57,6 +62,31 @@ A lightweight, standalone, high-performance S3-compatible object storage service
   - Embedded React 19 + Vite Web Console served directly from the server binary.
   - Full-featured CLI utility (`storagectl`) for administration and scripting.
   - Native Prometheus `/metrics` endpoint and `/health` probes.
+
+---
+
+## Enterprise Documentation & Architecture Guides
+
+Comprehensive technical documentation, operational runbooks, security specifications, and architecture manuals are maintained in the [`docs/`](docs/) directory:
+
+| Manual / Runbook | Description |
+| :--- | :--- |
+| **[System Architecture](docs/architecture.md)** | End-to-end component interactions, concurrency patterns, and design principles |
+| **[Threat Model & Security](docs/threat_model.md)** | STRIDE threat matrix, attack surface analysis, and defense-in-depth mitigations |
+| **[S3 API Compatibility](docs/s3_api_compatibility.md)** | Supported S3 REST operations, XML error formats, and AWS SDK compatibility |
+| **[Storage Engine Layout](docs/storage_layout.md)** | 2-level hashed filesystem layout, inode optimization, and atomic commit semantics |
+| **[Database Schema & Migrations](docs/database_schema.md)** | SQLite DDL schemas, indexes, WAL mode, pragmas, and versioning migrations |
+| **[Replication Topology](docs/replication_topology.md)** | Multi-peer outbox pattern, state machine, vector clocks, and conflict resolution |
+| **[Disaster Recovery Runbook](docs/disaster_recovery_runbook.md)** | Step-by-step catastrophic loss recovery, validation checklists, and RTO/RPO targets |
+| **[High Availability Architecture](docs/high_availability.md)** | Active-passive failover clustering, Keepalived/VRRP, and reverse proxy setup |
+| **[Security Hardening Guide](docs/security_hardening_guide.md)** | TLS 1.3 configuration, OS-level permissions, firewalls, and credential hygiene |
+| **[Capacity Planning Guide](docs/capacity_planning.md)** | IOPS, bandwidth, inode exhaustion modeling, and hardware sizing formulas |
+| **[Observability Runbook](docs/observability_runbook.md)** | Prometheus metrics catalog, Grafana dashboard configuration, and alert thresholds |
+| **[Incident Response Playbook](docs/incident_response_playbook.md)** | Playbooks for split-brain, corruption, disk exhaustion, and authentication lockouts |
+| **[Backup & Restore Guide](docs/backup_restore_guide.md)** | Hot backup procedures (`VACUUM INTO`), physical snapshots, and restoration validation |
+| **[Migration Guide](docs/migration_guide.md)** | Zero-downtime migration strategies from AWS S3, MinIO, or Ceph |
+| **[Performance Tuning Guide](docs/performance_tuning.md)** | Linux kernel sysctl, filesystem mount flags, Go GC tuning, and SQLite optimizations |
+| **[Troubleshooting Matrix](docs/troubleshooting_matrix.md)** | Fast diagnostics for error codes, HTTP statuses, and common operational failure modes |
 
 ---
 
@@ -168,9 +198,9 @@ go build -o storage-server ./cmd/storage-server
 
 ---
 
-## Configuration
+## Configuration & Environment Variables
 
-The storage server is configured via a YAML file. A default development configuration is available in [config.yaml](file:///Users/sumit/CodeRepos/my-s3-bucket/config.yaml), and a production template is provided in [deploy/config.example.yaml](file:///Users/sumit/CodeRepos/my-s3-bucket/deploy/config.example.yaml).
+The storage server is configured via a YAML file and supports full 12-factor environment variable overrides. A default development configuration is available in [config.yaml](file:///Users/sumit/CodeRepos/my-s3-bucket/config.yaml), and a production template is provided in [deploy/config.example.yaml](file:///Users/sumit/CodeRepos/my-s3-bucket/deploy/config.example.yaml).
 
 ### Configuration Reference (`config.yaml`)
 
@@ -179,12 +209,16 @@ server:
   host: "127.0.0.1"           # Bind interface ("0.0.0.0" for external access)
   s3_port: 9000               # S3 API port
   admin_port: 9001            # Web UI, Admin REST API, /metrics, /health
+  tls:
+    enabled: false            # Set true to enable native TLS/HTTPS on both ports
+    cert_file: ""             # Path to TLS certificate PEM (e.g. /etc/ssl/certs/s3.crt)
+    key_file: ""              # Path to TLS private key PEM (e.g. /etc/ssl/private/s3.key)
 
 storage:
   root: "./data/storage"      # Root directory for object storage files
   max_object_size: 5368709120 # Maximum object size in bytes (5 GB)
-  min_free_space_bytes: 0     # Admission control: minimum free bytes (optional)
-  min_free_space_percent: 0   # Admission control: minimum free percent (optional)
+  min_free_space_bytes: 10737418240 # Minimum free space before rejecting writes (10 GiB, 0 = disabled)
+  min_free_space_percent: 5.0 # Minimum free disk percentage before rejecting writes (default 5.0%)
 
 metadata:
   driver: "sqlite"            # Metadata store driver
@@ -195,7 +229,7 @@ security:
   admin_access_key: "storageadmin"
   admin_secret_key: "storageadminsecretkey123"
   admin_token: "storageadminsecretkey123" # Bearer / X-Admin-Token for Admin API
-  # encryption_key: "01234567890123456789012345678901" # Optional 32-byte AES-256 key
+  # encryption_key: "01234567890123456789012345678901" # Optional 32-byte AES-256 key for encryption-at-rest
 
 replication:
   enabled: false              # Multi-node replication
@@ -209,7 +243,28 @@ jobs:
 ```
 
 > [!NOTE]
-> On the first startup, if no access keys exist in the database, the server automatically bootstraps an `admin` user using the `admin_access_key` and `admin_secret_key` specified in your configuration file.
+> On the first startup, if no access keys exist in the database, the server automatically bootstraps an `admin` user using the `admin_access_key` and `admin_secret_key` specified in your configuration file. All secret keys stored in SQLite are transparently envelope-encrypted using AES-256-GCM.
+
+### Environment Variable Overrides
+
+Any setting in `config.yaml` can be overridden at runtime using environment variables:
+
+| Environment Variable | Overrides Config Setting | Example Value |
+| :--- | :--- | :--- |
+| `STORAGE_SERVER_HOST` | `server.host` | `0.0.0.0` |
+| `STORAGE_S3_PORT` | `server.s3_port` | `9000` |
+| `STORAGE_ADMIN_PORT` | `server.admin_port` | `9001` |
+| `STORAGE_TLS_ENABLED` | `server.tls.enabled` | `true` |
+| `STORAGE_TLS_CERT_FILE` | `server.tls.cert_file` | `/etc/ssl/certs/s3.crt` |
+| `STORAGE_TLS_KEY_FILE` | `server.tls.key_file` | `/etc/ssl/private/s3.key` |
+| `STORAGE_DATA_ROOT` | `storage.root` | `/var/lib/storage-engine/data` |
+| `STORAGE_METADATA_PATH` | `metadata.path` | `/var/lib/storage-engine/metadata/storage.db` |
+| `STORAGE_ADMIN_ACCESS_KEY` | `security.admin_access_key` | `admin-key-prod` |
+| `STORAGE_ADMIN_SECRET_KEY` | `security.admin_secret_key` | `super-secret-key-prod` |
+| `STORAGE_ADMIN_TOKEN` | `security.admin_token` | `admin-token-prod` |
+| `STORAGE_ENCRYPTION_KEY` | `security.encryption_key` | `32-byte-hex-or-passphrase-here` |
+| `STORAGE_REPLICATION_NODE_ID` | `replication.node_id` | `node-dc1-01` |
+| `STORAGE_REPLICATION_AUTH_TOKEN` | `replication.auth_token` | `rep-token-prod` |
 
 ---
 
@@ -253,6 +308,37 @@ sudo systemctl status storage-server
 # View live system logs
 sudo journalctl -u storage-server -f
 ```
+
+---
+
+## Enterprise Backup & Disaster Recovery
+
+Production-grade live hot backups and verified restores are supported out of the box via automated scripts in [`scripts/`](scripts/):
+
+### 1. Creating a Hot Online Backup
+
+The backup script uses SQLite's atomic `VACUUM INTO` mechanism to create a consistent metadata snapshot without stopping writes, followed by storage payload copying and SHA256 checksum manifest generation:
+
+```bash
+# Run backup to target directory
+./scripts/backup.sh /var/backups/storage-engine
+```
+
+**Artifacts Generated**:
+- `metadata.db`: Transactionally consistent SQLite database backup.
+- `storage_data.tar.gz`: Compressed archive of all physical object payloads.
+- `manifest.sha256`: Cryptographic checksums of all backup artifacts for tamper verification.
+
+### 2. Restoring from a Backup
+
+The restore script cryptographically validates SHA256 checksums, enforces safeguards to prevent accidental overwrites, and restores metadata and object files:
+
+```bash
+# Verify and restore from backup directory
+./scripts/restore.sh /var/backups/storage-engine/backup_20261015_050000 --force
+```
+
+For complete recovery workflows, point-in-time scenarios, and disaster playbooks, consult the **[Backup & Restore Guide](docs/backup_restore_guide.md)** and **[Disaster Recovery Runbook](docs/disaster_recovery_runbook.md)**.
 
 ---
 
@@ -522,6 +608,11 @@ go test -v ./tests/...
 ├── cmd/
 │   ├── storage-server/       # Storage Engine daemon main entrypoint
 │   └── storagectl/           # CLI management client entrypoint
+├── docs/                     # 16 Enterprise operational & architecture manuals
+├── deploy/
+│   ├── config.example.yaml   # Production configuration template
+│   ├── install.sh            # Automated Linux system installer script
+│   └── systemd/              # systemd service unit template
 ├── internal/
 │   ├── api/                  # Admin REST API & endpoints (/api/v1/*)
 │   ├── auth/                 # AWS SigV4 authentication & CORS middleware
@@ -535,15 +626,10 @@ go test -v ./tests/...
 │   ├── replication/          # Multi-node outbox replication & conflict handler
 │   ├── s3/                   # S3 XML API handlers, router, and error responses
 │   └── storage/              # 2-level hashed filesystem object engine
-├── deploy/
-│   ├── config.example.yaml   # Production configuration template
-│   ├── install.sh            # Automated Linux system installer script
-│   └── systemd/              # systemd service unit template
-├── web/                      # React 19 + TypeScript admin console (embedded)
+├── scripts/                  # Hot backup and verified disaster restore scripts
 ├── tests/                    # End-to-end integration tests
+├── web/                      # React 19 + TypeScript admin console (embedded)
 ├── config.yaml               # Local development configuration
-├── architecture.md           # Architecture design document
-├── implementation_plan.md    # Development milestone progress document
 ├── go.mod                    # Go module definition
 └── go.sum                    # Dependency checksums
 ```
@@ -586,4 +672,3 @@ curl -H "Authorization: Bearer storageadminsecretkey123" http://localhost:9001/a
 ## License
 
 This project is licensed under the MIT License.
-# my-s3-bucket

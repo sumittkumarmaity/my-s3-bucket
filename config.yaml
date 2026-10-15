@@ -3,10 +3,16 @@ server:
   host: "127.0.0.1"
   s3_port: 9000
   admin_port: 9001
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
 
 storage:
   root: "./data/storage"
   max_object_size: 5368709120
+  min_free_space_bytes: 0
+  min_free_space_percent: 5.0
 
 metadata:
   driver: "sqlite"

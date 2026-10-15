@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -123,6 +125,28 @@ func (s *Server) routes() {
 
 	// Audit Logs
 	s.mux.HandleFunc("GET /api/v1/audit-logs", s.handleListAuditLogs)
+
+	// System Backup
+	s.mux.HandleFunc("POST /api/v1/system/backup", s.handleBackup)
+}
+
+func (s *Server) audit(r *http.Request, action, resource, status string) {
+	user := "admin"
+	if u, _, ok := r.BasicAuth(); ok && u != "" {
+		user = u
+	}
+	ip := r.RemoteAddr
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		ip = strings.Split(fwd, ",")[0]
+	}
+	_ = s.meta.RecordAuditLog(r.Context(), metadata.AuditLog{
+		Action:    action,
+		Resource:  resource,
+		UserID:    user,
+		IPAddress: ip,
+		Status:    status,
+		Timestamp: time.Now().UTC(),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -225,6 +249,7 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "BUCKET_CREATE", b.Name, "SUCCESS")
 	writeJSON(w, http.StatusCreated, b)
 }
 
@@ -242,6 +267,7 @@ func (s *Server) handleDeleteBucket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "BUCKET_DELETE", name, "SUCCESS")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -305,6 +331,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "USER_CREATE", u.Username, "SUCCESS")
 	writeJSON(w, http.StatusCreated, u)
 }
 
@@ -358,6 +385,7 @@ func (s *Server) handleCreateAccessKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.audit(r, "KEY_CREATE", accessKeyID, "SUCCESS")
 	// Return secret key on creation only
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"access_key_id": accessKeyID,
@@ -374,6 +402,7 @@ func (s *Server) handleDeleteAccessKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "KEY_DELETE", id, "SUCCESS")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -408,6 +437,7 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "NODE_REGISTER", node.ID, "SUCCESS")
 	writeJSON(w, http.StatusOK, node)
 }
 
@@ -417,6 +447,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "NODE_DELETE", id, "SUCCESS")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -443,6 +474,7 @@ func (s *Server) handleTriggerGC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "JOB_TRIGGER_GC", "gc", "SUCCESS")
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -456,6 +488,7 @@ func (s *Server) handleTriggerIntegrityScan(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.audit(r, "JOB_TRIGGER_INTEGRITY", "integrity", "SUCCESS")
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -479,8 +512,30 @@ func (s *Server) handleListAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, logs)
 }
 
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Destination string `json:"destination"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Destination == "" {
+		req.Destination = filepath.Join("data", "backups", fmt.Sprintf("metadata-backup-%d.db", time.Now().Unix()))
+	}
+	cleanDest := filepath.Clean(req.Destination)
+	if err := s.meta.Backup(r.Context(), cleanDest); err != nil {
+		s.audit(r, "SYSTEM_BACKUP", cleanDest, "FAILED")
+		writeError(w, http.StatusInternalServerError, "Backup failed: "+err.Error())
+		return
+	}
+	s.audit(r, "SYSTEM_BACKUP", cleanDest, "SUCCESS")
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":      "SUCCESS",
+		"destination": cleanDest,
+	})
+}
+
 func randomHex(bytesLen int) string {
 	b := make([]byte, bytesLen)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+

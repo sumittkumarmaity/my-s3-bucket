@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -59,11 +60,11 @@ func CORSMiddleware(next http.Handler) http.Handler {
 func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !m.authEnabled {
-			// Anonymous dev mode: inject admin principal
+			// Anonymous dev mode: inject non-admin anonymous principal
 			ctx := context.WithValue(r.Context(), AuthUserKey, &Principal{
-				AccessKeyID: m.adminAccessKey,
-				UserID:      "admin",
-				IsAdmin:     true,
+				AccessKeyID: "anonymous",
+				UserID:      "anonymous",
+				IsAdmin:     false,
 			})
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -104,6 +105,14 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		}
 
 		if _, err := m.verifier.VerifyRequest(r, secretKey); err != nil {
+			if errors.Is(err, ErrRequestTimeTooSkewed) {
+				writeS3Error(w, http.StatusForbidden, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.")
+				return
+			}
+			if errors.Is(err, ErrRequestExpired) {
+				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Request has expired.")
+				return
+			}
 			writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 			return
 		}

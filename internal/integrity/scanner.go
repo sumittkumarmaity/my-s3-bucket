@@ -3,9 +3,11 @@ package integrity
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
+	"github.com/my-s3-bucket/storage-engine/internal/encryption"
 	"github.com/my-s3-bucket/storage-engine/internal/metadata"
 	"github.com/my-s3-bucket/storage-engine/internal/storage"
 )
@@ -21,19 +23,24 @@ type ScanReport struct {
 }
 
 type Scanner struct {
-	meta   metadata.Store
-	engine storage.Engine
-	logger *slog.Logger
+	meta      metadata.Store
+	engine    storage.Engine
+	encryptor encryption.Provider
+	logger    *slog.Logger
 }
 
-func NewScanner(meta metadata.Store, engine storage.Engine, logger *slog.Logger) *Scanner {
+func NewScanner(meta metadata.Store, engine storage.Engine, enc encryption.Provider, logger *slog.Logger) *Scanner {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if enc == nil {
+		enc = &encryption.NoOpProvider{}
+	}
 	return &Scanner{
-		meta:   meta,
-		engine: engine,
-		logger: logger,
+		meta:      meta,
+		engine:    engine,
+		encryptor: enc,
+		logger:    logger,
 	}
 }
 
@@ -74,7 +81,21 @@ func (s *Scanner) RunScan(ctx context.Context) (*ScanReport, error) {
 			continue
 		}
 
-		crc, _, _, bytesRead, err := ComputeChecksums(rc)
+		var readStream io.Reader = rc
+		if s.encryptor != nil && s.encryptor.IsEnabled() {
+			decStream, err := s.encryptor.Decrypt(rc)
+			if err != nil {
+				_ = rc.Close()
+				report.Corrupted++
+				msg := fmt.Sprintf("Decryption authentication tag failed for object %s (key: %s): %v", obj.ID, obj.ObjectKey, err)
+				s.logger.Error(msg)
+				report.Errors = append(report.Errors, msg)
+				continue
+			}
+			readStream = decStream
+		}
+
+		crc, _, _, bytesRead, err := ComputeChecksums(readStream)
 		_ = rc.Close()
 		if err != nil {
 			report.Corrupted++

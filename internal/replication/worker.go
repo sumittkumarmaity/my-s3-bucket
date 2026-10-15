@@ -38,8 +38,12 @@ func NewWorker(meta metadata.Store, engine storage.Engine, nodeID, authToken str
 		nodeID:       nodeID,
 		authToken:    authToken,
 		pollInterval: time.Duration(pollIntervalSec) * time.Second,
-		client:       &http.Client{Timeout: 30 * time.Second},
-		logger:       logger,
+		client: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 60 * time.Second,
+			},
+		},
+		logger: logger,
 	}
 }
 
@@ -87,20 +91,29 @@ func (w *Worker) processPendingJobs(ctx context.Context) {
 	}
 
 	for _, job := range jobs {
-		// Filter out self
 		for _, peer := range nodes {
 			if peer.ID == w.nodeID {
 				continue
 			}
+
+			// Check peer-specific status in replication_peer_status
+			status, retries, _ := w.meta.GetPeerReplicationStatus(ctx, job.ID, peer.ID)
+			if status == "COMPLETED" {
+				continue
+			}
+			if status == "FAILED" && retries >= 5 {
+				continue
+			}
+
 			err := w.replicateJobToPeer(ctx, job, peer)
 			if err != nil {
 				w.logger.Warn("Failed to replicate job to peer",
 					"job_id", job.ID, "peer", peer.Address, "err", err)
-				_ = w.meta.UpdateReplicationJobStatus(ctx, job.ID, "FAILED", err.Error())
+				_ = w.meta.UpdatePeerReplicationStatus(ctx, job.ID, peer.ID, "FAILED", err.Error())
 			} else {
 				w.logger.Info("Successfully replicated job to peer",
 					"job_id", job.ID, "peer", peer.Address)
-				_ = w.meta.UpdateReplicationJobStatus(ctx, job.ID, "COMPLETED", "")
+				_ = w.meta.UpdatePeerReplicationStatus(ctx, job.ID, peer.ID, "COMPLETED", "")
 			}
 		}
 	}
@@ -115,6 +128,8 @@ func (w *Worker) replicateJobToPeer(ctx context.Context, job metadata.Replicatio
 		return fmt.Errorf("failed to get bucket: %w", err)
 	}
 
+	// Dynamic timeout: 60s baseline + 1s per 1MB
+	timeout := 60 * time.Second
 	var body io.Reader
 	var req *http.Request
 
@@ -124,14 +139,20 @@ func (w *Worker) replicateJobToPeer(ctx context.Context, job metadata.Replicatio
 			return fmt.Errorf("failed to fetch object metadata: %w", err)
 		}
 
-		rc, err := w.engine.Get(ctx, obj.ID)
+		if obj.Size > 0 {
+			timeout += time.Duration(obj.Size/(1024*1024)) * time.Second
+		}
+		jobCtx, jobCancel := context.WithTimeout(ctx, timeout)
+		defer jobCancel()
+
+		rc, err := w.engine.Get(jobCtx, obj.ID)
 		if err != nil {
 			return fmt.Errorf("failed to read physical object: %w", err)
 		}
 		defer rc.Close()
 		body = rc
 
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, syncURL, body)
+		req, err = http.NewRequestWithContext(jobCtx, http.MethodPost, syncURL, body)
 		if err != nil {
 			return err
 		}
@@ -147,8 +168,11 @@ func (w *Worker) replicateJobToPeer(ctx context.Context, job metadata.Replicatio
 		req.Header.Set("X-Replication-Size", fmt.Sprintf("%d", obj.Size))
 		req.Header.Set("X-Replication-ContentType", obj.ContentType)
 	} else {
+		jobCtx, jobCancel := context.WithTimeout(ctx, timeout)
+		defer jobCancel()
+
 		// DELETE action
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, syncURL, nil)
+		req, err = http.NewRequestWithContext(jobCtx, http.MethodPost, syncURL, nil)
 		if err != nil {
 			return err
 		}

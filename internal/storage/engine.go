@@ -33,6 +33,9 @@ type Engine interface {
 	// DiskUsage returns the volume statistics.
 	DiskUsage(ctx context.Context) (DiskUsage, error)
 
+	// CheckCapacity checks whether there is sufficient storage capacity for requiredBytes.
+	CheckCapacity(ctx context.Context, requiredBytes int64) error
+
 	// Multipart operations
 	PutPart(ctx context.Context, uploadID string, partNumber int, r io.Reader) (bytesWritten int64, physicalPath string, err error)
 	AssembleParts(ctx context.Context, physicalID string, partPaths []string) (totalBytes int64, err error)

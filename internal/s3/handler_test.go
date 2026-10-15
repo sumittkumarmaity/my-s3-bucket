@@ -243,6 +243,22 @@ func TestS3MultipartUpload(t *testing.T) {
 	if w.Body.Len() != len(p1Data)+len(p2Data) {
 		t.Fatalf("expected length %d, got %d", len(p1Data)+len(p2Data), w.Body.Len())
 	}
+
+	// 7. Abort Multipart with Path Traversal Attack -> Must be rejected with 404 NoSuchUpload
+	abortTraversalReq := httptest.NewRequest(http.MethodDelete, "/mp-bucket/bigfile.bin?uploadId=..", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, abortTraversalReq)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for traversal uploadId, got %d", w.Code)
+	}
+
+	// Verify object still exists and was not deleted by traversal
+	verifyReq := httptest.NewRequest(http.MethodGet, "/mp-bucket/bigfile.bin", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, verifyReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("object was deleted by traversal attack! status: %d", w.Code)
+	}
 }
 
 func TestS3Versioning(t *testing.T) {

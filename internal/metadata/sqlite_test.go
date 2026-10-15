@@ -262,3 +262,87 @@ func TestSQLiteStore(t *testing.T) {
 		t.Fatalf("failed to list conflicts: %v, len=%d", err, len(confs))
 	}
 }
+
+func TestAccessKeyEnvelopeEncryption(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "storage-enckey-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Enable encryption
+	masterKey := "super-secure-master-key-32-bytes!"
+	store.SetEncryptionKey(masterKey)
+
+	// Create user and access key
+	user := User{
+		ID:        "user-enc-1",
+		Username:  "enc-user",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := store.CreateUser(ctx, user); err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	rawSecret := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	ak := AccessKey{
+		AccessKeyID:   "AKIAIOSFODNN7EXAMPLE",
+		SecretKeyHash: rawSecret,
+		UserID:        user.ID,
+		Status:        "ACTIVE",
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := store.CreateAccessKey(ctx, ak); err != nil {
+		t.Fatalf("failed to create access key: %v", err)
+	}
+
+	// 1. Inspect raw SQLite database value to verify it is encrypted
+	var rawStoredSecret string
+	err = store.db.QueryRow("SELECT secret_key_hash FROM access_keys WHERE access_key_id = ?", ak.AccessKeyID).Scan(&rawStoredSecret)
+	if err != nil {
+		t.Fatalf("failed to query raw secret: %v", err)
+	}
+	if rawStoredSecret == rawSecret {
+		t.Fatalf("secret key was stored in plaintext! Expected ciphertext")
+	}
+	if len(rawStoredSecret) < 10 || rawStoredSecret[:7] != "enc:v1:" {
+		t.Fatalf("expected encrypted secret to start with 'enc:v1:', got: %s", rawStoredSecret)
+	}
+
+	// 2. Fetch through store API and verify decryption
+	fetched, err := store.GetAccessKey(ctx, ak.AccessKeyID)
+	if err != nil {
+		t.Fatalf("failed to get access key: %v", err)
+	}
+	if fetched.SecretKeyHash != rawSecret {
+		t.Fatalf("expected decrypted secret %s, got %s", rawSecret, fetched.SecretKeyHash)
+	}
+
+	// 3. Backward compatibility: insert an unencrypted legacy secret directly
+	legacyAKID := "AKIALEGACYUNENCRYPTED"
+	legacySecret := "legacySecretPlaintext123456"
+	_, err = store.db.Exec("INSERT INTO access_keys (access_key_id, secret_key_hash, user_id, status, created_at) VALUES (?, ?, ?, ?, ?)",
+		legacyAKID, legacySecret, user.ID, "ACTIVE", time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		t.Fatalf("failed to insert legacy key: %v", err)
+	}
+
+	fetchedLegacy, err := store.GetAccessKey(ctx, legacyAKID)
+	if err != nil {
+		t.Fatalf("failed to get legacy key: %v", err)
+	}
+	if fetchedLegacy.SecretKeyHash != legacySecret {
+		t.Fatalf("expected legacy plain secret %s, got %s", legacySecret, fetchedLegacy.SecretKeyHash)
+	}
+}
+

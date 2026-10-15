@@ -180,3 +180,48 @@ func TestAdmissionControl(t *testing.T) {
 		t.Fatalf("expected write to succeed with small threshold, got: %v", err)
 	}
 }
+
+func TestDeleteMultipartUploadPathTraversalProtection(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "storage-traversal-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	engine, err := NewLocalDiskEngine(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Put a normal object to verify it is NOT deleted
+	canaryID := "00a1b2c3-4d5e-6f70-8192-a3b4c5d6e7f8"
+	_, err = engine.Put(ctx, canaryID, bytes.NewReader([]byte("canary data")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt path traversal via uploadID
+	traversalPayloads := []string{
+		"..",
+		"../..",
+		"/",
+		"../../objects",
+		"upload/../../",
+	}
+
+	for _, payload := range traversalPayloads {
+		err := engine.DeleteMultipartUpload(ctx, payload)
+		if err == nil {
+			t.Fatalf("expected error for traversal payload %q, got nil", payload)
+		}
+	}
+
+	// Verify canary object is still present and root was not wiped
+	rc, err := engine.Get(ctx, canaryID)
+	if err != nil {
+		t.Fatalf("canary object missing! Storage root may have been deleted: %v", err)
+	}
+	_ = rc.Close()
+}

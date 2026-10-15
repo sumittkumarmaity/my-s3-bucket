@@ -22,6 +22,7 @@ var (
 	ErrAccessKeyNotFound      = errors.New("invalid Access Key ID")
 	ErrSignatureDoesNotMatch  = errors.New("signature does not match")
 	ErrRequestExpired         = errors.New("request has expired")
+	ErrRequestTimeTooSkewed   = errors.New("request time is too skewed")
 	ErrUnsupportedAlgorithm   = errors.New("unsupported signature algorithm, only AWS4-HMAC-SHA256 is supported")
 )
 
@@ -237,12 +238,21 @@ func (v *SigV4Verifier) VerifyRequest(r *http.Request, secretKey string) (*SigV4
 		return nil, err
 	}
 
+	now := time.Now().UTC()
 	// Check expiration for presigned URLs
 	if details.IsPresigned {
-		now := time.Now().UTC()
 		expiresAt := details.Timestamp.Add(time.Duration(details.Expires) * time.Second)
 		if now.After(expiresAt) {
 			return nil, ErrRequestExpired
+		}
+	} else {
+		// Enforce clock skew for standard requests (15 minutes)
+		diff := now.Sub(details.Timestamp)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > 15*time.Minute {
+			return nil, ErrRequestTimeTooSkewed
 		}
 	}
 

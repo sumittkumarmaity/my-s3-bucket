@@ -2,11 +2,18 @@ package metadata
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,8 +21,68 @@ import (
 )
 
 type SQLiteStore struct {
-	db *sql.DB
+	db     *sql.DB
+	encKey []byte
 }
+
+func (s *SQLiteStore) SetEncryptionKey(secret string) {
+	if secret != "" {
+		hash := sha256.Sum256([]byte(secret))
+		s.encKey = hash[:]
+	}
+}
+
+func (s *SQLiteStore) encryptSecret(plain string) (string, error) {
+	if len(s.encKey) == 0 || plain == "" {
+		return plain, nil
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return plain, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return plain, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return plain, err
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(plain), nil)
+	return "enc:v1:" + hex.EncodeToString(sealed), nil
+}
+
+func (s *SQLiteStore) decryptSecret(stored string) (string, error) {
+	if !strings.HasPrefix(stored, "enc:v1:") {
+		return stored, nil
+	}
+	if len(s.encKey) == 0 {
+		return stored, nil
+	}
+	raw, err := hex.DecodeString(stored[len("enc:v1:"):])
+	if err != nil {
+		return stored, nil
+	}
+	block, err := aes.NewCipher(s.encKey)
+	if err != nil {
+		return stored, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return stored, err
+	}
+	if len(raw) < gcm.NonceSize() {
+		return stored, nil
+	}
+	nonce := raw[:gcm.NonceSize()]
+	ciphertext := raw[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return stored, err
+	}
+	return string(plain), nil
+}
+
 
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	dir := filepath.Dir(dbPath)
@@ -122,6 +189,18 @@ func (s *SQLiteStore) migrate() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_outbox_status 
 			ON replication_outbox(status, created_at ASC);`,
+		`CREATE TABLE IF NOT EXISTS replication_peer_status (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			outbox_id INTEGER NOT NULL REFERENCES replication_outbox(id) ON DELETE CASCADE,
+			peer_id TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'PENDING',
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL,
+			UNIQUE(outbox_id, peer_id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_status 
+			ON replication_peer_status(outbox_id, peer_id, status);`,
 		`CREATE TABLE IF NOT EXISTS replication_conflicts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			bucket_name TEXT NOT NULL,
@@ -887,10 +966,15 @@ func (s *SQLiteStore) CreateAccessKey(ctx context.Context, key AccessKey) error 
 		key.Status = "ACTIVE"
 	}
 
+	secretToStore := key.SecretKeyHash
+	if enc, err := s.encryptSecret(key.SecretKeyHash); err == nil {
+		secretToStore = enc
+	}
+
 	query := `INSERT INTO access_keys (access_key_id, secret_key_hash, user_id, status, created_at)
 		VALUES (?, ?, ?, ?, ?)`
 	_, err := s.db.ExecContext(ctx, query,
-		key.AccessKeyID, key.SecretKeyHash, key.UserID, key.Status, key.CreatedAt.Format(time.RFC3339Nano),
+		key.AccessKeyID, secretToStore, key.UserID, key.Status, key.CreatedAt.Format(time.RFC3339Nano),
 	)
 	return err
 }
@@ -911,6 +995,9 @@ func (s *SQLiteStore) GetAccessKey(ctx context.Context, accessKeyID string) (Acc
 		return AccessKey{}, err
 	}
 	k.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	if dec, err := s.decryptSecret(k.SecretKeyHash); err == nil {
+		k.SecretKeyHash = dec
+	}
 	return k, nil
 }
 
@@ -941,6 +1028,9 @@ func (s *SQLiteStore) ListAccessKeys(ctx context.Context, userID string) ([]Acce
 			return nil, err
 		}
 		k.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		if dec, err := s.decryptSecret(k.SecretKeyHash); err == nil {
+			k.SecretKeyHash = dec
+		}
 		keys = append(keys, k)
 	}
 	return keys, nil
@@ -1103,6 +1193,46 @@ func (s *SQLiteStore) UpdateReplicationJobStatus(ctx context.Context, id int64, 
 	}
 }
 
+func (s *SQLiteStore) GetPeerReplicationStatus(ctx context.Context, outboxID int64, peerID string) (string, int, error) {
+	var status string
+	var retryCount int
+	query := `SELECT status, retry_count FROM replication_peer_status WHERE outbox_id = ? AND peer_id = ?`
+	err := s.db.QueryRowContext(ctx, query, outboxID, peerID).Scan(&status, &retryCount)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "PENDING", 0, nil
+		}
+		return "", 0, err
+	}
+	return status, retryCount, nil
+}
+
+func (s *SQLiteStore) UpdatePeerReplicationStatus(ctx context.Context, outboxID int64, peerID string, status string, errMsg string) error {
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	query := `INSERT INTO replication_peer_status (outbox_id, peer_id, status, retry_count, last_error, updated_at)
+		VALUES (?, ?, ?, CASE WHEN ? = 'FAILED' THEN 1 ELSE 0 END, ?, ?)
+		ON CONFLICT(outbox_id, peer_id) DO UPDATE SET
+			status = excluded.status,
+			retry_count = CASE WHEN excluded.status = 'FAILED' THEN replication_peer_status.retry_count + 1 ELSE replication_peer_status.retry_count END,
+			last_error = excluded.last_error,
+			updated_at = excluded.updated_at`
+	_, err := s.db.ExecContext(ctx, query, outboxID, peerID, status, status, errMsg, nowStr)
+	if err != nil {
+		return err
+	}
+
+	if status == "COMPLETED" {
+		var pendingCount int
+		_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM replication_peer_status WHERE outbox_id = ? AND status != 'COMPLETED'`, outboxID).Scan(&pendingCount)
+		if pendingCount == 0 {
+			_ = s.UpdateReplicationJobStatus(ctx, outboxID, "COMPLETED", "")
+		}
+	} else if status == "FAILED" {
+		_ = s.UpdateReplicationJobStatus(ctx, outboxID, "FAILED", errMsg)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) RecordReplicationConflict(ctx context.Context, conflict ReplicationConflict) error {
 
 	if conflict.DetectedAt.IsZero() {
@@ -1205,3 +1335,14 @@ func searchSubstr(s, substr string) bool {
 	}
 	return false
 }
+
+func (s *SQLiteStore) Backup(ctx context.Context, destPath string) error {
+	_ = os.Remove(destPath)
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", destPath))
+	return err
+}
+
